@@ -8,40 +8,50 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
 const SITE_URL = process.env.SITE_URL || "https://theroyalpaynes.vibepreview.com";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
 
   try {
-    const { amount, customerName, customerEmail, orderDetails, source } = req.body;
+    const { amount, customerName, customerEmail, orderDetails, source, successUrl, cancelUrl } = req.body;
+
     const totalCents = Math.round(parseFloat(amount) * 100);
-    if (!totalCents || totalCents < 50) return res.status(400).json({ error: "Invalid order amount" });
+    if (!totalCents || totalCents < 50) {
+      return res.status(400).json({ error: "Invalid order amount" });
+    }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       mode: "payment",
       customer_email: customerEmail || undefined,
-      line_items: [{
-        quantity: 1,
-        price_data: {
-          currency: "usd",
-          unit_amount: totalCents,
-          product_data: {
-            name: source === "live-form" ? "Live Engraving Order" : "The Royal Payne Order",
-            description: orderDetails ? orderDetails.slice(0, 200) : "Personalized keepsakes & engraving",
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: totalCents,
+            product_data: {
+              name: source === "live-form" ? "Live Engraving Order" : "The Royal Payne Order",
+              description: orderDetails ? orderDetails.slice(0, 200) : "Personalized keepsakes & engraving",
+            },
           },
         },
-      }],
+      ],
       metadata: {
         customer_name: customerName || "",
         source: source || "shop",
         order_details: orderDetails || "",
       },
-      success_url: `${SITE_URL}/?payment=success`,
-      cancel_url: `${SITE_URL}/?payment=cancelled`,
+      success_url: successUrl || `${SITE_URL}/?payment=success`,
+      cancel_url: cancelUrl || `${SITE_URL}/?payment=cancelled`,
     });
 
     return res.status(200).json({ url: session.url });
