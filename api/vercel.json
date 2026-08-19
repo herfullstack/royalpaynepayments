@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "functions": {
+    "api/**/*.ts": {
+      "runtime": "@vercel/node@5"
+    }
+  },
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/$1" }
+  ]
+}
+File 3: package.json
+{
+  "name": "royal-payne-payments",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@vercel/node": "^5.10.1",
+    "stripe": "^22.5.0"
+  }
+}
