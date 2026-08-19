@@ -1,0 +1,1 @@
+{"name": "royal-payne-payments", "version": "1.0.0", "private": true, "dependencies": {"@vercel/node": "^5.10.1", "stripe": "^22.5.0"}}
