@@ -86,6 +86,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(400).json({ error: `Webhook signature verification failed: ${err?.message}` });
   }
 
+const stripeForApi = getStripe(!event.livemode);
+  
   try {
     switch (event.type) {
       case "checkout.session.completed": {
@@ -94,30 +96,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const testMode = session.metadata?.test_mode === "true";
 
         // 1. Update order status to "paid"
-        if (orderId) {
-          const { data: existing } = await supabase
-            .from("rp_orders")
-            .select("data")
-            .eq("id", "singleton")
-            .maybeSingle();
+        {
+  const { data: existing } = await supabase
+    .from("rp_orders")
+    .select("data")
+    .eq("id", "singleton")
+    .maybeSingle();
 
-          let orders = (existing?.data as any[]) || [];
-          orders = orders.map((o: any) =>
-            o.id === orderId
-              ? { ...o, status: "paid", stripeSessionId: session.id, updatedAt: new Date().toISOString() }
-              : o
-          );
-          await supabase.from("rp_orders").upsert({
-            id: "singleton",
-            data: orders,
-            updated_at: new Date().toISOString(),
-          }, { onConflict: "id" });
+  let orders = (existing?.data as any[]) || [];
+  const idx = orderId ? orders.findIndex((o: any) => o.id === orderId) : -1;
 
-          console.log(`[Webhook] Order ${orderId} marked as paid`);
-        }
+  if (idx >= 0) {
+    orders[idx] = { ...orders[idx], status: "paid", stripeSessionId: session.id, updatedAt: new Date().toISOString() };
+  } else {
+    const cd = session.customer_details as any;
+    orders.push({
+      id: orderId || `stripe_${session.id}`,
+      status: "paid",
+      source: (session.metadata?.source as string) || "online",
+      customer: {
+        name: session.metadata?.customer_name || cd?.name || "",
+        email: session.customer_email || cd?.email || "",
+        phone: cd?.phone || "",
+      },
+      items: [],
+      subtotal: (session.amount_total || 0) / 100,
+      total: (session.amount_total || 0) / 100,
+      notes: "Reconstructed from Stripe payment (no matching pending order found).",
+      stripeSessionId: session.id,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    console.log(`[Webhook] Order ${orderId || session.id} not found locally, inserted reconstructed order from Stripe session`);
+  }
+
+  await supabase.from("rp_orders").upsert({
+    id: "singleton",
+    data: orders,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: "id" });
+
+  console.log(`[Webhook] Order ${orderId || session.id} marked as paid`);
+}
 
         // 2. Decrement inventory
-        const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
+        const lineItems = await stripeForApi.checkout.sessions.listLineItems(session.id, { limit: 100 });
         const productIds = (session.metadata?.product_ids || "").split(",").filter(Boolean);
 
         if (productIds.length > 0) {
