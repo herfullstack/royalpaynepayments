@@ -66,25 +66,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const stripe = getStripe();
-  const supabase = getSupabase();
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+const supabase = getSupabase();
+const liveWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+const testWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET_TEST;
 
-  const rawBodyBuffer = await getRawBody(req);
+const rawBodyBuffer = await getRawBody(req);
 
-  // Verify the webhook signature
-  let event: Stripe.Event;
+// Verify the webhook signature. Live-mode and test-mode events arrive at
+// this same URL but are signed with different secrets, so try the live
+// secret first and fall back to the test secret.
+const sig = req.headers["stripe-signature"] as string;
+let event: Stripe.Event;
+try {
+  if (liveWebhookSecret && sig) {
+    event = stripe.webhooks.constructEvent(rawBodyBuffer, sig, liveWebhookSecret);
+  } else {
+    throw new Error("no live webhook secret configured");
+  }
+} catch (liveErr: any) {
   try {
-    const sig = req.headers["stripe-signature"] as string;
-    if (webhookSecret && sig) {
-      event = stripe.webhooks.constructEvent(rawBodyBuffer, sig, webhookSecret);
-    } else {
-      // Fallback: parse the raw body if no webhook secret configured (not recommended for production)
+    if (testWebhookSecret && sig) {
+      event = stripe.webhooks.constructEvent(rawBodyBuffer, sig, testWebhookSecret);
+    } else if (!liveWebhookSecret && !testWebhookSecret) {
       event = JSON.parse(rawBodyBuffer.toString("utf8")) as Stripe.Event;
+    } else {
+      throw liveErr;
     }
   } catch (err: any) {
     console.error("[Webhook] Signature verification failed:", err?.message);
     return res.status(400).json({ error: `Webhook signature verification failed: ${err?.message}` });
   }
+}
+}
 
 const stripeForApi = getStripe(!event.livemode);
   
