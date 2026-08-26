@@ -10,6 +10,8 @@
  * STRIPE_WEBHOOK_SECRET - from Stripe Dashboard > Developers > Webhooks
  * SUPABASE_URL - your Supabase project URL
  * SUPABASE_SERVICE_ROLE_KEY - service role key (NOT the anon key)
+ * GHL_PRIVATE_TOKEN - GoHighLevel Private Integration token (Contacts read/write)
+ * GHL_LOCATION_ID - optional, defaults to The Royal Payne's location
  *
  * In Stripe Dashboard, create a webhook endpoint pointing to:
  * https://royalpaynepayments.vercel.app/api/stripe-webhook
@@ -60,6 +62,87 @@ function getSupabase() {
   return createClient(url, serviceKey);
 }
 
+// ---------------------------------------------------------------------
+// GoHighLevel CRM sync
+//
+// After a real order comes in, upsert the customer as a GHL contact and
+// tag them by sales channel ("market-sale" for walk-up/live-form orders,
+// "shop-order" for online checkout orders) so GHL workflows can pick up
+// from there (e.g. sending the order confirmation email via GHL).
+//
+// This is best-effort: it never throws back into the caller, so a GHL
+// outage or misconfiguration can never block an order from being marked
+// paid or inventory from being decremented above/below.
+// ---------------------------------------------------------------------
+const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID || "ilz6J23AOyTkJyjhqE5b";
+const GHL_API_BASE = "https://services.leadconnectorhq.com";
+
+async function syncCustomerToGHL(
+  customer: { name?: string; email?: string; phone?: string },
+  tag: string
+) {
+  const token = process.env.GHL_PRIVATE_TOKEN;
+  if (!token) {
+    console.log("[GHL] Skipping sync - GHL_PRIVATE_TOKEN not configured");
+    return;
+  }
+  if (!customer.email) {
+    console.log("[GHL] Skipping sync - order has no customer email");
+    return;
+  }
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Version: "2021-07-28",
+    "Content-Type": "application/json",
+  };
+
+  try {
+    const nameParts = (customer.name || "").trim().split(/\s+/).filter(Boolean);
+    const firstName = nameParts[0] || undefined;
+    const lastName = nameParts.slice(1).join(" ") || undefined;
+
+    const upsertRes = await fetch(`${GHL_API_BASE}/contacts/upsert`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        locationId: GHL_LOCATION_ID,
+        email: customer.email,
+        phone: customer.phone || undefined,
+        firstName,
+        lastName,
+      }),
+    });
+
+    if (!upsertRes.ok) {
+      console.error("[GHL] Contact upsert failed:", upsertRes.status, await upsertRes.text());
+      return;
+    }
+
+    const upsertData: any = await upsertRes.json();
+    const contactId = upsertData?.contact?.id;
+    if (!contactId) {
+      console.error("[GHL] Contact upsert response missing contact id:", JSON.stringify(upsertData));
+      return;
+    }
+
+    const tagRes = await fetch(`${GHL_API_BASE}/contacts/${contactId}/tags`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ tags: [tag] }),
+    });
+
+    if (!tagRes.ok) {
+      console.error("[GHL] Tagging failed:", tagRes.status, await tagRes.text());
+      return;
+    }
+
+    console.log(`[GHL] Synced ${customer.email} (contact ${contactId}) with tag "${tag}"`);
+  } catch (err: any) {
+    console.error("[GHL] Sync error:", err?.message);
+  }
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -104,6 +187,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const session = event.data.object as Stripe.Checkout.Session;
         const orderId = session.metadata?.order_id;
         const testMode = session.metadata?.test_mode === "true";
+        const cd = session.customer_details as any;
+        const orderSource = (session.metadata?.source as string) || "online";
 
         // 1. Update order status to "paid", and collect that order's own
         //    line items so we can decrement inventory below. We only grab
@@ -127,11 +212,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             }
             orders[idx] = { ...orders[idx], status: "paid", stripeSessionId: session.id, updatedAt: new Date().toISOString() };
           } else {
-            const cd = session.customer_details as any;
             orders.push({
               id: orderId || `stripe_${session.id}`,
               status: "paid",
-              source: (session.metadata?.source as string) || "online",
+              source: orderSource,
               customer: {
                 name: session.metadata?.customer_name || cd?.name || "",
                 email: session.customer_email || cd?.email || "",
@@ -192,6 +276,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             console.log(`[Webhook] Inventory decremented for order ${orderId || session.id}`);
           }
         }
+
+        // 3. Sync the customer into the GHL CRM, tagged by sales channel.
+        //    Best-effort - never blocks the order/inventory logic above.
+        const ghlTag = orderSource === "live-form" ? "market-sale" : "shop-order";
+        await syncCustomerToGHL(
+          {
+            name: session.metadata?.customer_name || cd?.name || "",
+            email: session.customer_email || cd?.email || "",
+            phone: cd?.phone || "",
+          },
+          ghlTag
+        );
+
         break;
       }
 
