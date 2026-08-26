@@ -97,7 +97,6 @@ try {
     return res.status(400).json({ error: `Webhook signature verification failed: ${err?.message}` });
   }
 }
-}
 
 const stripeForApi = getStripe(!event.livemode);
   
