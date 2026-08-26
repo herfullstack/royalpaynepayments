@@ -5,19 +5,19 @@
  * URL: /api/stripe-webhook
  *
  * Set these env vars in Vercel:
- *   STRIPE_SECRET_KEY        - your live secret key
- *   STRIPE_SECRET_KEY_TEST   - your test secret key
- *   STRIPE_WEBHOOK_SECRET    - from Stripe Dashboard > Developers > Webhooks
- *   SUPABASE_URL             - your Supabase project URL
- *   SUPABASE_SERVICE_ROLE_KEY - service role key (NOT the anon key)
+ * STRIPE_SECRET_KEY - your live secret key
+ * STRIPE_SECRET_KEY_TEST - your test secret key
+ * STRIPE_WEBHOOK_SECRET - from Stripe Dashboard > Developers > Webhooks
+ * SUPABASE_URL - your Supabase project URL
+ * SUPABASE_SERVICE_ROLE_KEY - service role key (NOT the anon key)
  *
  * In Stripe Dashboard, create a webhook endpoint pointing to:
- *   https://royalpaynepayments.vercel.app/api/stripe-webhook
+ * https://royalpaynepayments.vercel.app/api/stripe-webhook
  *
  * Subscribe to these events:
- *   - checkout.session.completed
- *   - checkout.session.expired
- *   - charge.refunded
+ * - checkout.session.completed
+ * - checkout.session.expired
+ * - charge.refunded
  */
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
@@ -66,40 +66,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const stripe = getStripe();
-const supabase = getSupabase();
-const liveWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-const testWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET_TEST;
+  const supabase = getSupabase();
+  const liveWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const testWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET_TEST;
 
-const rawBodyBuffer = await getRawBody(req);
+  const rawBodyBuffer = await getRawBody(req);
 
-// Verify the webhook signature. Live-mode and test-mode events arrive at
-// this same URL but are signed with different secrets, so try the live
-// secret first and fall back to the test secret.
-const sig = req.headers["stripe-signature"] as string;
-let event: Stripe.Event;
-try {
-  if (liveWebhookSecret && sig) {
-    event = stripe.webhooks.constructEvent(rawBodyBuffer, sig, liveWebhookSecret);
-  } else {
-    throw new Error("no live webhook secret configured");
-  }
-} catch (liveErr: any) {
+  // Verify the webhook signature. Live-mode and test-mode events arrive at
+  // this same URL but are signed with different secrets, so try the live
+  // secret first and fall back to the test secret.
+  const sig = req.headers["stripe-signature"] as string;
+  let event: Stripe.Event;
   try {
-    if (testWebhookSecret && sig) {
-      event = stripe.webhooks.constructEvent(rawBodyBuffer, sig, testWebhookSecret);
-    } else if (!liveWebhookSecret && !testWebhookSecret) {
-      event = JSON.parse(rawBodyBuffer.toString("utf8")) as Stripe.Event;
+    if (liveWebhookSecret && sig) {
+      event = stripe.webhooks.constructEvent(rawBodyBuffer, sig, liveWebhookSecret);
     } else {
-      throw liveErr;
+      throw new Error("no live webhook secret configured");
     }
-  } catch (err: any) {
-    console.error("[Webhook] Signature verification failed:", err?.message);
-    return res.status(400).json({ error: `Webhook signature verification failed: ${err?.message}` });
+  } catch (liveErr: any) {
+    try {
+      if (testWebhookSecret && sig) {
+        event = stripe.webhooks.constructEvent(rawBodyBuffer, sig, testWebhookSecret);
+      } else if (!liveWebhookSecret && !testWebhookSecret) {
+        event = JSON.parse(rawBodyBuffer.toString("utf8")) as Stripe.Event;
+      } else {
+        throw liveErr;
+      }
+    } catch (err: any) {
+      console.error("[Webhook] Signature verification failed:", err?.message);
+      return res.status(400).json({ error: `Webhook signature verification failed: ${err?.message}` });
+    }
   }
-}
 
-const stripeForApi = getStripe(!event.livemode);
-  
   try {
     switch (event.type) {
       case "checkout.session.completed": {
@@ -107,55 +105,63 @@ const stripeForApi = getStripe(!event.livemode);
         const orderId = session.metadata?.order_id;
         const testMode = session.metadata?.test_mode === "true";
 
-        // 1. Update order status to "paid"
+        // 1. Update order status to "paid", and collect that order's own
+        //    line items so we can decrement inventory below. We only grab
+        //    the items (and only decrement) the first time an order is
+        //    marked paid, so a Stripe webhook redelivery/resend can never
+        //    double-decrement stock.
+        let paidOrderItems: any[] = [];
         {
-  const { data: existing } = await supabase
-    .from("rp_orders")
-    .select("data")
-    .eq("id", "singleton")
-    .maybeSingle();
+          const { data: existing } = await supabase
+            .from("rp_orders")
+            .select("data")
+            .eq("id", "singleton")
+            .maybeSingle();
 
-  let orders = (existing?.data as any[]) || [];
-  const idx = orderId ? orders.findIndex((o: any) => o.id === orderId) : -1;
+          let orders = (existing?.data as any[]) || [];
+          const idx = orderId ? orders.findIndex((o: any) => o.id === orderId) : -1;
 
-  if (idx >= 0) {
-    orders[idx] = { ...orders[idx], status: "paid", stripeSessionId: session.id, updatedAt: new Date().toISOString() };
-  } else {
-    const cd = session.customer_details as any;
-    orders.push({
-      id: orderId || `stripe_${session.id}`,
-      status: "paid",
-      source: (session.metadata?.source as string) || "online",
-      customer: {
-        name: session.metadata?.customer_name || cd?.name || "",
-        email: session.customer_email || cd?.email || "",
-        phone: cd?.phone || "",
-      },
-      items: [],
-      subtotal: (session.amount_total || 0) / 100,
-      total: (session.amount_total || 0) / 100,
-      notes: "Reconstructed from Stripe payment (no matching pending order found).",
-      stripeSessionId: session.id,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-    console.log(`[Webhook] Order ${orderId || session.id} not found locally, inserted reconstructed order from Stripe session`);
-  }
+          if (idx >= 0) {
+            if (orders[idx].status !== "paid") {
+              paidOrderItems = orders[idx].items || [];
+            }
+            orders[idx] = { ...orders[idx], status: "paid", stripeSessionId: session.id, updatedAt: new Date().toISOString() };
+          } else {
+            const cd = session.customer_details as any;
+            orders.push({
+              id: orderId || `stripe_${session.id}`,
+              status: "paid",
+              source: (session.metadata?.source as string) || "online",
+              customer: {
+                name: session.metadata?.customer_name || cd?.name || "",
+                email: session.customer_email || cd?.email || "",
+                phone: cd?.phone || "",
+              },
+              items: [],
+              subtotal: (session.amount_total || 0) / 100,
+              total: (session.amount_total || 0) / 100,
+              notes: "Reconstructed from Stripe payment (no matching pending order found).",
+              stripeSessionId: session.id,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+            console.log(`[Webhook] Order ${orderId || session.id} not found locally, inserted reconstructed order from Stripe session`);
+          }
 
-  await supabase.from("rp_orders").upsert({
-    id: "singleton",
-    data: orders,
-    updated_at: new Date().toISOString(),
-  }, { onConflict: "id" });
+          await supabase.from("rp_orders").upsert({
+            id: "singleton",
+            data: orders,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: "id" });
 
-  console.log(`[Webhook] Order ${orderId || session.id} marked as paid`);
-}
+          console.log(`[Webhook] Order ${orderId || session.id} marked as paid`);
+        }
 
-        // 2. Decrement inventory
-        const lineItems = await stripeForApi.checkout.sessions.listLineItems(session.id, { limit: 100 });
-        const productIds = (session.metadata?.product_ids || "").split(",").filter(Boolean);
-
-        if (productIds.length > 0) {
+        // 2. Decrement inventory using the order's own items (real
+        //    productId + quantity, set client-side at checkout) rather than
+        //    Stripe metadata or line items - this is purely internal stock
+        //    tracking so the shop owner doesn't oversell what's on hand.
+        if (paidOrderItems.length > 0) {
           const { data: prodData } = await supabase
             .from("rp_products")
             .select("data")
@@ -163,29 +169,28 @@ const stripeForApi = getStripe(!event.livemode);
             .maybeSingle();
 
           let products = (prodData?.data as any[]) || [];
+          const qtyByProductId: Record<string, number> = {};
+          for (const li of paidOrderItems) {
+            if (!li?.productId) continue;
+            qtyByProductId[li.productId] = (qtyByProductId[li.productId] || 0) + (li.quantity || 1);
+          }
+
+          let changed = false;
           products = products.map((p: any) => {
-            if (!productIds.includes(p.id)) return p;
-            // Count how many of this product were ordered
-            const qty = lineItems.data.reduce((sum, li) => {
-              // Match by product name in line item description
-              if (li.description?.includes(p.name)) {
-                return sum + (li.quantity || 1);
-              }
-              return sum;
-            }, 0);
-            if (p.stock != null && p.stock > 0) {
-              return { ...p, stock: Math.max(0, p.stock - qty) };
-            }
-            return p;
+            const qty = qtyByProductId[p.id];
+            if (!qty || p.stock == null) return p;
+            changed = true;
+            return { ...p, stock: Math.max(0, p.stock - qty) };
           });
 
-          await supabase.from("rp_products").upsert({
-            id: "singleton",
-            data: products,
-            updated_at: new Date().toISOString(),
-          }, { onConflict: "id" });
-
-          console.log(`[Webhook] Inventory decremented for ${productIds.length} products`);
+          if (changed) {
+            await supabase.from("rp_products").upsert({
+              id: "singleton",
+              data: products,
+              updated_at: new Date().toISOString(),
+            }, { onConflict: "id" });
+            console.log(`[Webhook] Inventory decremented for order ${orderId || session.id}`);
+          }
         }
         break;
       }
